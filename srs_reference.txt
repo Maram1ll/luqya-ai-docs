@@ -1,0 +1,944 @@
+================================================================================================
+  SRS REFERENCE — LUQYA AI (لُقيا AI)
+  University AI-Powered Lost & Found System
+------------------------------------------------------------------------------------------------
+  Purpose : Technical reference extracted from the actual source code, to support the
+            preparation of the Software Requirements Specification (SRS) document.
+  Sources : database/schema.sql, config/*.php, api/*.php, index.php, profile.php,
+            security_dashboard.php, README.md
+  Note    : Every statement below was verified against the code, not assumed. Where the
+            code and README.md disagree, the code is treated as authoritative and the
+            difference is flagged in section 10.
+================================================================================================
+
+
+================================================================================================
+  1. PROJECT OVERVIEW
+================================================================================================
+
+1.1 Problem Statement
+    University campuses continuously generate lost and found items. Items are usually
+    reported informally (word of mouth, noticeboards) and are frequently never returned,
+    because owners and finders cannot identify each other's belongings. Physical handover
+    is a real problem too: handing an item to the wrong person is a security risk.
+
+1.2 What the System Is
+    A web application for a single university campus that digitises the whole lost-and-found
+    cycle: reporting, intelligent matching, owner identification, secure code-based
+    handover, and an auditable close-out.
+
+1.3 Main Objectives (as implemented)
+    O1. Let any student register a LOST report quickly, with a photo and a description.
+    O2. Let any student (or security officer) register a FOUND report, including scanning
+        a university ID card to pre-fill owner details.
+    O3. Automatically propose a match between a LOST report and a FOUND report.
+    O4. Prevent wrongful handover: an item is released only after an officer verifies a
+        unique pickup code, the student's identity, and the physical item.
+    O5. Keep the student informed automatically (notifications) at every state change.
+    O6. Keep a tamper-evident activity trail of all sensitive operations.
+    O7. Be designed and developed fully in Arabic (RTL) to seamlessly support the
+        Saudi university environment - the UI and the entire system are Arabic-first.
+
+1.4 Scope Boundaries
+    IN SCOPE   : single campus, Arabic (RTL) only, web-only, campus network.
+    OUT OF SCOPE: multi-campus federation, mobile apps, payment, email/SMS delivery,
+                  external identity provider (SSO), inter-campus item shipping.
+
+1.5 Technology Stack (as found in the code)
+    ------------------------------------------------------------------------------------
+    Layer          Technology
+    ------------------------------------------------------------------------------------
+    Language       PHP 8 (procedural, no framework)
+    Database       MySQL / MariaDB via PDO (InnoDB, utf8mb4_unicode_ci)
+    Web server     Apache under XAMPP (dev). The built-in PHP server also works.
+    Front end      Server-rendered PHP + HTML5 + CSS3 + Vanilla ES6+ JavaScript
+    AI provider    Google Gemini (REST via cURL, generativelanguage.googleapis.com)
+    Auth           PHP native sessions, bcrypt (password_hash / PASSWORD_DEFAULT)
+    Security       CSRF tokens, prepared statements, rate limiting, upload validation
+    ------------------------------------------------------------------------------------
+    There is no JavaScript framework, no Composer package manager usage, and no ORM.
+    All SQL is hand-written and passed through PDO prepared statements.
+
+
+================================================================================================
+  2. ACTORS AND ROLES
+================================================================================================
+
+  The role is stored in users.role as an ENUM with three values: 'student', 'security',
+  'admin'. Two roles are actively enforced in the code; 'admin' exists in the schema but
+  no admin-specific branch was found in the API layer.
+
+  2.1 Student (role = 'student')
+      - Self-registers with a university ID; cannot choose their own role.
+      - Creates LOST and FOUND reports.
+      - Sees their own reports and lifecycle progress on the profile page.
+      - Sees high-confidence potential matches for their own lost items.
+      - Closes their own report when the item is no longer being sought.
+
+  2.2 Security Officer (role = 'security')
+      - Accounts are provisioned by the administrator, not self-registered.
+      - Is redirected away from the student home page to security_dashboard.php.
+      - May create FOUND reports but is explicitly BLOCKED from creating LOST reports
+        (api/reports.php returns HTTP 403 for a security officer submitting type='lost').
+      - Verifies pickup codes, confirms or rejects matches, records physical handover.
+
+  2.3 Administrator (role = 'admin')
+      - Declared in the schema. No dedicated admin UI or API branch was located in the
+        current code. Treat as reserved/future scope in the SRS.
+
+  2.4 Public / Guest
+      - Can view the public home page, metrics, the report grid, search, and the FAQ.
+      - Cannot create reports or read the notification centre without logging in.
+
+
+================================================================================================
+  3. IDENTITY AND AUTHENTICATION REQUIREMENTS
+================================================================================================
+
+3.1 University ID Format
+      - Students: exactly the letter 'S' followed by 9 digits.   Example: S202403400
+      - Officers: the prefix 'SEC-USR-' followed by digits.      Example: SEC-USR-1
+      - Validation functions: validateUniversityID(), validateSecurityCode(),
+        validateLoginIdentifier() in config/db.php.
+      - Validation is enforced on the server, and the README states it is also enforced
+        in the front end.
+
+3.2 Institutional Email
+      - Derived automatically from the university ID, not typed by the user.
+        generateUniversityEmail() produces  S202403400@uoh.edu.sa
+      - The domain is hard-coded in the code and should become a configurable parameter
+        in the SRS.
+
+3.3 Registration Rules (api/auth.php, action='register')
+      - Role is forced to 'student'; the client cannot request any other role.
+      - university_id must match the format and must be unique.
+      - full_name is required, maximum 100 characters, sanitised against XSS.
+      - phone is optional, maximum 20 characters, digits/plus/spaces/dashes only.
+      - college and major are optional, maximum 100 characters each.
+      - password minimum 6 characters; stored only as a bcrypt hash.
+      - Registration is rate-limited to 5 attempts per hour per client IP.
+      - On success the user is logged in automatically and the session ID is regenerated
+        (session_regenerate_id(true)) to prevent session fixation.
+
+3.4 Login (api/auth.php, action='login')
+      - Accepts either the university ID or the institutional email as the identifier.
+      - Password is verified against the bcrypt hash.
+      - Rate-limited; protected by a CSRF token.
+
+3.4.1 Quick Demo Login (login.php, config/db.php :: demoLoginAccounts())
+      - Requirement: an evaluator must be able to exercise the system immediately,
+        without registering an account and without any seeded-account knowledge.
+      - Behaviour: when the environment flag LUQYA_DEMO_LOGIN is not 0 (default 1),
+        login.php renders a "دخول تجريبي سريع" panel with one button per role. Each
+        button carries the demo identifier and password in data-demo-pass /
+        data-demo-id and, when clicked, copies them into university_id and password.
+        The user then presses the normal submit button.
+      - SECURITY CONSTRAINT (the reason this is a pre-fill and not a shortcut): the
+        panel adds NO server-side authentication path. The request still goes to
+        api/auth.php?action=login, so requireCsrf(), enforceRateLimit('login', 10, 300)
+        and password_verify() all still execute exactly as for a typed login. The flag
+        controls only whether the panel is rendered; set LUQYA_DEMO_LOGIN=0 in production
+        to remove it from the page.
+      - Verified demo accounts (checked with password_verify() against the seeded table):
+          SEC-USR-1  / security123  -> role 'security' -> security_dashboard.php
+          S202403400 / password123  -> role 'student'  -> index.php
+        The officer seed is planted by ensureSecurityOfficers() as a bcrypt digest of
+        'security123'; the three students S202403400, S202409876 and S202401234 share
+        the seeded 'password123' digest. No plaintext password is stored in the source.
+      - S202447940 is deliberately NOT listed: its digest differs from the shared
+        student password, so it cannot be offered as a one-click demo.
+
+3.5 Forgotten Password (api/auth.php, actions='forgot_password' and 'reset_password')
+      - A single-use token is generated, and only its SHA-256 hash is stored in
+        password_resets.token_hash (CHAR(64)). The raw token is never persisted.
+      - The record carries expires_at and a used_at consumption marker.
+      - Token lifetime is 1800 seconds (30 minutes). Any earlier unused token for the
+        same user is deleted before a new one is issued, so only one can be live.
+      - The response is a single generic message for every case, so the endpoint cannot
+        be used to enumerate which university IDs or emails exist.
+      - STRICT IDENTITY VERIFICATION (required, not optional): the request must supply
+        university_id AND email. The account is resolved by university ID, then the
+        email must match the registered address exactly (case-insensitive). The
+        optional security_code is checked with password_verify() against
+        security_code_hash, and is REQUIRED only when the account has one. Legacy
+        accounts created before the security-code feature (security_code_hash empty)
+        reset with university ID + email alone, so they can never be locked out.
+      - ANTI-ENUMERATION TIMING: a dummy bcrypt verification (an inert hash with no
+        matching account) runs on the no-account and no-code paths, so response timing
+        stays flat and cannot reveal whether an ID exists.
+      - ACTION 'set_security_code' (login required, rate 5 / 900 s): lets any user
+        create or replace their recovery security code after verifying current_password;
+        the code is stored only as a bcrypt hash in security_code_hash and is never
+        returned or logged. The profile page exposes it through the toggleable
+        "الإعدادات الأمنية" card.
+      - Registration (action='register') accepts an optional security_code (6-64 chars,
+        confirmed field) that is stored as a bcrypt hash for later password recovery.
+      - An officer's authentication security code (their SEC-USR-<id> login) also acts
+        as the recovery code: because security_code_hash is set for every officer, an
+        officer recovers a forgotten password with SEC-USR-<id> + registered email +
+        the code.
+      - The raw token is written to the server log ONLY when the environment flag
+        LUQYA_EXPOSE_RESET_TOKEN is set to 1 (isResetTokenExposedToLog() in
+        config/db.php). The default and the production value is 0.
+        This is a development convenience and must remain 0 in production.
+      - MAILER ABSENCE (structural): this build contains no mail transport, no SMTP
+        configuration and no mailer dependency. The recovery flow is therefore complete
+        without any live email server, and the documentation must not claim that a
+        message is delivered. Two supported completion paths exist:
+          (a) DEVELOPMENT - with LUQYA_EXPOSE_RESET_TOKEN=1, api/auth.php writes
+              "Luqya AI: [DEV ONLY] password reset link for user #N -
+               forgot_password.php?step=reset&token=<raw>" via error_log(), and
+              forgot_password.php displays a notice telling the reviewer where to look.
+              On a stock XAMPP install error_log in php.ini points at
+              C:\xampp\php\logs\php_error_log, but that directory does not exist, so
+              the entry is emitted to Apache's own log instead:
+              C:\xampp\apache\logs\error.log. This is the verified location.
+          (b) PRODUCTION - a real mailer must be added, or an administrator issues the
+              link out of band. The token table and hashing design already support
+              this unchanged; only the delivery step is missing.
+
+
+================================================================================================
+  4. DATABASE SCHEMA
+================================================================================================
+
+  SIX tables are defined in database/schema.sql, which is in turn the single source of
+  truth. A runtime migration function, ensureSchemaUpgrades(PDO) in config/db.php, brings
+  older databases up to the same structure, so both paths converge.
+
+  Engine: InnoDB. Charset: utf8mb4. Collation: utf8mb4_unicode_ci.
+  Every foreign key uses ON DELETE CASCADE.
+
+  Verified totals: 6 tables, 59 columns, 22 indexes, 5 foreign keys, 1 CHECK constraint.
+    users ............. 13 columns   5 indexes
+    reports .......... 17 columns   4 indexes
+    matches .......... 10 columns   4 indexes (2 UNIQUE + 1 FK-support index)
+    notifications ..... 7 columns   2 indexes
+    activity_logs ..... 6 columns   3 indexes
+    password_resets ... 6 columns   4 indexes
+
+  The 5 foreign keys are: reports.user_id, matches.lost_report_id,
+  matches.found_report_id, notifications.user_id and password_resets.user_id.
+  Three of them (reports.user_id, notifications.user_id, password_resets.user_id) reuse an
+  existing index whose leftmost column matches, so InnoDB does not add an extra index for
+  them; only matches.found_report_id receives an automatic FK-support index, because
+  matches.lost_report_id is already the leading column of uk_matches_pair.
+
+  READING NOTE ON THE "Null" COLUMN: every id column is declared as
+  "INT AUTO_INCREMENT PRIMARY KEY" with no explicit NOT NULL keyword. MySQL/MariaDB
+  always treats an AUTO_INCREMENT primary key as NOT NULL, so this document records
+  Null = NO for those six columns, which is what the server actually stores. Every other
+  column's NOT NULL in this document is written literally in schema.sql.
+
+------------------------------------------------------------------------------------------------
+  4.1 users  (13 columns) — accounts
+------------------------------------------------------------------------------------------------
+   #  Column              Type           Null  Key    Default / Notes
+   -------------------------------------------------------------------------------------
+   1  id                  INT            NO    PRI    AUTO_INCREMENT
+   2  university_id       VARCHAR(20)    NO    UNI    S + 9 digits
+   3  full_name           VARCHAR(100)   NO          -
+   4  email               VARCHAR(100)   NO    UNI    institutional address
+   5  phone               VARCHAR(20)    YES          NULL
+   6  college             VARCHAR(100)   YES          NULL
+   7  major               VARCHAR(100)   YES          NULL
+   8  password_hash       VARCHAR(255)   NO          bcrypt hash
+   9  role                ENUM           YES          'student'
+                          values: 'student', 'security', 'admin'
+  10  security_code       VARCHAR(20)    YES   UNI    LEGACY - always NULL (see note)
+  11  security_code_hash  VARCHAR(255)   YES          NULL  security/recovery code, bcrypt
+  12  created_at          DATETIME       NO          CURRENT_TIMESTAMP
+  13  updated_at          DATETIME       YES          CURRENT_TIMESTAMP ON UPDATE
+
+  Indexes : PRIMARY(id), UNI(university_id), UNI(email), UNI(security_code),
+            IDX(idx_users_role on role)
+
+  IMPORTANT — how an officer account actually authenticates:
+   - The officer's login code IS their university_id, of the form SEC-USR-<id>
+     (SEC-USR-1, SEC-USR-7, SEC-USR-8, SEC-USR-9 in the seed data).
+   - The migration in config/db.php deliberately sets the legacy security_code column
+     to NULL and stores the code only as a bcrypt hash in security_code_hash, verified
+     with password_verify(). The column is therefore retained for backward
+     compatibility only and is NULL for every row in the current seed data.
+   - password_hash holds the account password; security_code_hash holds a security code
+     (an officer's SEC-USR-<id> login code, or an optional student recovery code set via
+     set_security_code or at registration). Both are 60-character bcrypt digests and
+     neither is ever stored in plaintext.
+
+------------------------------------------------------------------------------------------------
+  4.2 reports  (17 columns) — lost and found notices
+------------------------------------------------------------------------------------------------
+   #  Column                 Type          Null  Key  Default / Notes
+   -------------------------------------------------------------------------------------
+   1  id                     INT           NO    PRI  AUTO_INCREMENT
+   2  user_id                INT           NO    FK   -> users(id)
+   3  type                   ENUM          NO        'lost' or 'found'
+   4  title                  VARCHAR(200)  NO        -
+   5  category               VARCHAR(50)   NO        -
+   6  description            TEXT          NO        -
+   7  location               VARCHAR(250)  NO        -
+   8  date_event             DATE          NO        -
+   9  image_url              VARCHAR(255)  YES       NULL
+  10  ai_tags                VARCHAR(500)  YES       NULL
+  11  ocr_data               TEXT          YES       NULL  raw OCR / ID card JSON
+  12  distinctive_features   TEXT          YES       NULL  visual analysis output
+  13  status                 ENUM          YES       'active'
+                           values: 'active', 'matched', 'pending_pickup',
+                                   'resolved', 'cancelled'
+  14  pickup_code            VARCHAR(20)   YES       NULL  shared by both sides of a pair
+  15  resolved_at            DATETIME      YES       NULL
+  16  created_at             DATETIME      NO        CURRENT_TIMESTAMP
+  17  updated_at             DATETIME      YES       CURRENT_TIMESTAMP ON UPDATE
+
+  Indexes : PRIMARY(id),
+           IDX idx_reports_user_status (user_id, status),
+           IDX idx_reports_status_type (status, type),
+           IDX idx_reports_pickup (pickup_code)
+  Foreign key: user_id -> users(id) ON DELETE CASCADE
+
+  NOTE ON THE FIELD COUNT: this table has 17 columns in database/schema.sql. The companion
+  document luqya_database_schema.txt deliberately lists 16 fields and omits updated_at,
+  because the business specification for that document is limited to the 16 business
+  fields. For the SRS, treat column 17 (updated_at) as a real, existing column.
+
+------------------------------------------------------------------------------------------------
+  4.3 matches  (10 columns) — the pairing of one lost report with one found report
+------------------------------------------------------------------------------------------------
+   #  Column             Type         Null  Key   Default / Notes
+   -------------------------------------------------------------------------------------
+   1  id                 INT          NO    PRI   AUTO_INCREMENT
+   2  lost_report_id     INT          NO    FK    -> reports(id)
+   3  found_report_id    INT          NO    FK    -> reports(id)
+   4  confidence_score   INT          NO          85
+   5  pickup_code        VARCHAR(20)  YES   UNI   NULL
+   6  status             ENUM         YES         'pending'
+                         values: 'pending', 'verified', 'rejected'
+   7  matched_at         DATETIME     YES         CURRENT_TIMESTAMP
+   8  resolved_at        DATETIME     YES         NULL
+   9  created_at         DATETIME     NO          CURRENT_TIMESTAMP
+  10  updated_at         DATETIME     YES          CURRENT_TIMESTAMP ON UPDATE
+
+  Indexes    : PRIMARY(id), UNI uk_matches_pair(lost_report_id, found_report_id),
+               UNI uk_matches_pickup(pickup_code)
+  found_report_id additionally carries an index that InnoDB creates automatically to
+  satisfy the foreign key; it is not written as a named index in the DDL. lost_report_id
+  needs no extra index because uk_matches_pair already has it as its leading column.
+  Constraint : chk_matches_confidence  CHECK (confidence_score BETWEEN 0 AND 100)
+
+  Design rules encoded in the schema:
+   - A (lost, found) pair can exist only once  -> uk_matches_pair
+   - A non-null pickup_code can identify only one match -> uk_matches_pickup
+   - A rejected match stores pickup_code = NULL, not ''. A UNIQUE index permits many NULL
+     values but only one empty string, so NULL is required to record several rejections.
+   - confidence_score is bounded by a CHECK constraint, so the value is always 0..100.
+
+------------------------------------------------------------------------------------------------
+  4.4 notifications  (7 columns) — per-user messages
+------------------------------------------------------------------------------------------------
+   #  Column      Type         Null  Key  Default / Notes
+   -------------------------------------------------------------------------------------
+   1  id          INT          NO    PRI  AUTO_INCREMENT
+   2  user_id     INT          NO    FK   -> users(id)
+   3  title       VARCHAR(150) NO         -
+   4  message     TEXT         NO         -
+   5  type        VARCHAR(50)  YES        'info'
+   6  is_read     TINYINT(1)   YES        0
+   7  created_at  DATETIME     NO         CURRENT_TIMESTAMP
+
+  Indexes : PRIMARY(id), IDX idx_notifications_feed (user_id, is_read, created_at)
+  type is deliberately VARCHAR and not an ENUM, to allow flexible message types.
+  Values used by the application: 'info', 'match_found', 'resolved'.
+  The value 'match_found' is what the header view expects in order to display the
+  smart-match icon.
+
+------------------------------------------------------------------------------------------------
+  4.5 activity_logs  (6 columns) — audit trail
+------------------------------------------------------------------------------------------------
+   #  Column        Type          Null  Key  Default / Notes
+   -------------------------------------------------------------------------------------
+   1  id            INT           NO    PRI  AUTO_INCREMENT
+   2  action_type   VARCHAR(50)   NO         -
+   3  item_title    VARCHAR(200)  NO         -
+   4  details       TEXT          NO         -
+   5  user_name     VARCHAR(100)  NO         -
+   6  created_at    DATETIME      NO         CURRENT_TIMESTAMP
+
+  Indexes : PRIMARY(id), IDX(idx_activity_logs_created on created_at),
+           IDX(idx_activity_logs_action on action_type)
+  There is deliberately NO foreign key on this table: an audit record must survive the
+  deletion of the user it refers to.
+  action_type is VARCHAR, not an ENUM. Values written by the code:
+           'match'            config/matching.php   automatic match created
+           'match_confirmed'  api/security.php      officer confirmed a match
+           'handover'         api/security.php      physical handover recorded
+           'add_found'        api/security.php      officer added a found item
+           'edit_found'       api/security.php      officer edited a found item
+  'ocr_scan' also appears in the seed data of database/schema.sql, but no code path
+  writes it, so it is a legacy value only.
+
+------------------------------------------------------------------------------------------------
+  4.6 password_resets  (6 columns) — password recovery
+------------------------------------------------------------------------------------------------
+   #  Column        Type      Null  Key  Default / Notes
+   -------------------------------------------------------------------------------------
+   1  id            INT       NO    PRI  AUTO_INCREMENT
+   2  user_id       INT       NO    FK   -> users(id)
+   3  token_hash    CHAR(64)  NO    UNI  SHA-256 of the token
+   4  expires_at    DATETIME  NO         -
+   5  used_at       DATETIME  YES        NULL
+   6  created_at    DATETIME  NO         CURRENT_TIMESTAMP
+
+  Indexes : PRIMARY(id), UNI(token_hash), IDX(idx_resets_user on user_id),
+           IDX(idx_resets_expiry on expires_at)
+  The raw reset token is never stored.
+
+------------------------------------------------------------------------------------------------
+  4.7 Entity Relationship Summary
+------------------------------------------------------------------------------------------------
+   users 1 ────< reports        (one user may raise many reports)
+   users 1 ────< notifications
+   users 1 ────< password_resets
+   reports 1 ────< matches  (as lost_report_id)   ON DELETE CASCADE
+   reports 1 ────< matches  (as found_report_id)  ON DELETE CASCADE
+   activity_logs — no relationship (intentionally standalone audit trail)
+
+   Cardinality note: a report belongs to exactly one user; a match always links exactly
+   one lost report to exactly one found report, and that pair is unique.
+
+------------------------------------------------------------------------------------------------
+  4.8 Field Length Contract
+------------------------------------------------------------------------------------------------
+  The application validates input length in PHP (config/schema.php) before writing,
+  because the server does not run in strict SQL mode and would otherwise truncate
+  silently. The application limits must never exceed the column widths.
+
+   Constant (config/schema.php)     Value   Column
+   -------------------------------------------------------------------------------------
+   REPORT_TITLE_MAX                 200     reports.title            VARCHAR(200)
+   REPORT_CATEGORY_MAX               50     reports.category         VARCHAR(50)
+   REPORT_DESCRIPTION_MAX           4000    reports.description      TEXT
+   REPORT_LOCATION_MAX              250     reports.location         VARCHAR(250)
+   REPORT_AI_TAGS_MAX               500     reports.ai_tags          VARCHAR(500)
+   REPORT_FEATURES_MAX              2000    reports.distinctive_features  TEXT
+   REPORT_IMAGE_URL_MAX             255     reports.image_url        VARCHAR(255)
+   NOTIFICATION_TITLE_MAX           150     notifications.title      VARCHAR(150)
+   NOTIFICATION_TYPE_MAX             50     notifications.type       VARCHAR(50)
+   ACTIVITY_ITEM_TITLE_MAX          200     activity_logs.item_title VARCHAR(200)
+   ACTIVITY_DETAILS_MAX             2000    activity_logs.details    TEXT
+   USER_FULL_NAME_MAX               100     users.full_name          VARCHAR(100)
+
+  No explicit PHP limit exists for password_hash or security_code_hash; both are
+  VARCHAR(255) and hold a 60-character bcrypt digest.
+
+
+================================================================================================
+  5. FUNCTIONAL REQUIREMENTS — AS IMPLEMENTED
+================================================================================================
+
+5.1 MODULE: USERS AND ACCESS CONTROL
+  FR-U1  The system shall allow a visitor to register a student account by supplying a
+         valid university ID, name, optional phone, optional college and major, and a
+         password of at least 6 characters.
+  FR-U2  The system shall force every self-registered account to the 'student' role.
+  FR-U3  The system shall generate the institutional email automatically from the
+         university ID and shall reject a duplicate university ID or email.
+  FR-U4  The system shall allow a registered user to log in using either the university
+         ID or the institutional email, plus the password.
+  FR-U5  The system shall store passwords only as bcrypt hashes.
+  FR-U6  The system shall provide a forgot-password and reset-password flow using a
+         single-use, time-limited, hashed token. Before issuing a token it shall resolve
+         the account by university ID, require the email to match the registered address
+         exactly, and require the security code whenever the account has one; accounts
+         without a code (legacy) shall reset with university ID + email alone.
+  FR-U6a The system shall let a logged-in user set or replace their recovery security
+         code after confirming the current password (action='set_security_code'), storing
+         only a bcrypt hash, and shall accept an optional security code (6-64 chars) at
+         registration for use in later recovery.
+  FR-U7  The system shall enforce role-based access: a security officer cannot create a
+         LOST report; a student cannot reach any security dashboard action.
+  FR-U8  The system shall limit registration attempts to 5 per hour per client IP.
+  FR-U9  The system shall regenerate the session identifier on login and on registration
+         to prevent session fixation.
+  FR-U10 The system shall redirect a logged-in security officer away from the public
+         home page to the security dashboard.
+
+5.2 MODULE: REPORTS (lost and found)
+  FR-R1  The system shall allow a logged-in user to create a LOST report with title,
+         category, description, location, event date, and an optional photo.
+  FR-R2  The system shall allow a logged-in user, or a security officer, to create a
+         FOUND report with the same fields.
+  FR-R3  The system shall automatically trigger the matching engine immediately after a
+         report is stored.
+  FR-R4  The system shall validate every field against its maximum length and reject the
+         request with HTTP 400 and an explanatory message if a limit is exceeded.
+  FR-R5  The system shall require title, description and location to be non-empty.
+  FR-R6  The system shall accept a date only in YYYY-MM-DD format and default to the
+         current date otherwise.
+  FR-R7  The system shall generate a unique pickup code for every new FOUND report so
+         that it can be verified at the security desk immediately.
+  FR-R8  The system shall improve the description using the AI provider before saving,
+         and shall continue normally if the AI provider is unavailable.
+  FR-R9  The system shall upload the report photo to the uploads/ directory after
+         validating the real file content, enforcing a maximum size, deriving the
+         extension from the detected format, and assigning a random file name.
+  FR-R10 The system shall allow a report owner to close their own report; closing a report
+         also closes the matches associated with it.
+  FR-R11 The system shall expose the current status of the authenticated user's own
+         reports, and the list of statuses, through dedicated API actions.
+  FR-R12 The system shall reject any status value outside the five permitted values with
+         HTTP 400, rather than silently discarding it.
+  FR-R13 When a status update request omits the status field, the system shall preserve
+         the report's current status instead of resetting it to 'active'.
+
+5.3 MODULE: INTELLIGENT MATCHING  (config/matching.php)
+  The matching engine is a HYBRID engine. A deterministic, weighted, in-database
+  scorer always runs first; a Gemini semantic layer then re-ranks its shortlist.
+  The local stage requires no external call and remains the hard prerequisite for
+  any automatic match, so the engine still functions completely offline.
+
+  FR-M1  The system shall compare a new report against all opposite-type reports that are
+         still 'active', and shall score each candidate pair.
+  FR-M2  The local scoring shall be weighted as follows (constants in config/matching.php):
+             category match                        40 points
+             location match                        25 points
+             central text overlap (base)            40 points
+             central text overlap (high-value item) 55 points
+             description overlap                   10 points
+             distinctive features bonus (base)      15 points
+             distinctive features bonus (high)      25 points
+             OCR student-ID match bonus             30 points
+         "High-value" small items (headphones, chargers, cables, keys) receive the
+         higher text and feature weights because they are easily confused.
+  FR-M3  The system shall normalise Arabic text and tokenise it before comparing, so that
+         different letter forms and diacritics do not prevent a match.
+  FR-M4  The system shall extract a student ID from the ocr_data field and treat an exact
+         student-ID equality as a strong match signal. OCR student IDs shall be
+         canonicalised to the form S + 9 digits (Arabic-Indic digits converted,
+         separators stripped, uppercased) before comparison.
+  FR-M5  The system shall apply three thresholds:
+             75  minimum score to create a match automatically
+             45  minimum score to show a suggestion to a security officer
+             75  minimum score to show a suggestion to the student
+         Low-confidence suggestions are hidden from the student and left for officer review.
+  FR-M5a The system shall blend the local score with the Gemini semantic score for shortlisted
+         candidates, using:
+             blended = round(local x (1 - W) + ai x W),  W = MATCH_AI_BLEND_WEIGHT (0.40)
+         and shall use the blended value for all threshold comparisons. It shall retain
+         local_score, ai.score and their disagreement for transparency.
+  FR-M5b The semantic layer shall be strictly subordinate to the local scorer. It shall never
+         introduce a candidate the local scorer did not produce, and no blend of a local
+         score below MATCH_AI_MIN_LOCAL (45) with a perfect AI score may reach the
+         automatic-match threshold. The AI may lower a candidate below the threshold, or
+         rescue one the local scorer underrated, but cannot authorise a match alone.
+  FR-M5c The system shall not call Gemini at all when GEMINI_API_KEY is absent or
+         AI_MATCHING_ENABLED=0. In that state the engine shall return the local scores
+         unchanged, with ai = null, and no report submission, matching, verification or
+         handover path shall fail.
+  FR-M5d The system shall bound the cost of the semantic layer: at most MATCH_AI_MAX_PAIRS
+         (5) pairs analysed per call, a spend floor of MATCH_AI_MIN_LOCAL below which no
+         call is made, and a hard ceiling of MATCH_AI_MAX_CALLS_PER_REQUEST (2) Gemini calls
+         per HTTP request regardless of how many times the engine is invoked.
+  FR-M5e A repeated semantic query for the same report pair within one request shall be
+         served from an in-memory cache, so that retrieving both the integer score and the
+         detailed verdict costs at most one external call. Successful and failed results
+         shall both be cached, to prevent retry storms during an outage.
+  FR-M5f Where the semantic layer runs, the engine shall shortlist from the AI spend floor
+         (45) rather than the automatic-match threshold, so the blend can promote a pair the
+         local scorer underrated; the final decision shall still require blended >= 75.
+  FR-M6  On an automatic match the system shall create a matches row with status
+         'pending'. It shall NOT resolve the reports itself.
+  FR-M7  On an automatic match the system shall set the lost report to 'matched' and the
+         found report to 'pending_pickup', and shall copy the same pickup code to both.
+  FR-M8  The system shall not re-propose a pair that already has a match row, and shall
+         not re-propose a pair that an officer has rejected.
+  FR-M9  After a match the system shall send a 'match_found' notification to the owner of
+         the lost report, including the confidence percentage and the pickup code.
+  FR-M10 The system shall write an activity log entry for every match it creates.
+  FR-M11 The system shall expand a match to the full lost+found pair so that both sides
+         are always displayed and updated together.
+  FR-M12 The result of an automatic match shall report whether the score was AI-blended or
+         purely local, exposing local_score, ai_score, ai_verified and the full ai payload,
+         so that a consumer can never mistake a local-only score for an AI-verified one.
+  FR-M13 The semantic layer shall run on all three consumer surfaces: automatic matching at
+         report creation, the student "potential matches" list, and the officer review queue.
+         On the officer queue, an officer's own on-demand AI analysis shall take precedence
+         over the engine's automatic verdict, and neither shall erase the other.
+
+5.4 MODULE: SECURITY OFFICER DASHBOARD  (api/security.php, security_dashboard.php)
+  FR-S1  The system shall provide a dashboard that lists two work queues:
+         (a) found items awaiting pickup or documentation, and
+         (b) suggested pairs awaiting human review.
+  FR-S2  The system shall allow an officer to verify a code. The lookup shall accept the
+         pickup code, the owner's university ID, or a value contained in ocr_data.
+  FR-S3  On a successful verification the system shall return both reports of the pair
+         together with the match record, regardless of which side the code matched.
+  FR-S4  The system shall return HTTP 404 with a clear message if no record matches.
+  FR-S5  The system shall allow an officer to confirm a suggested match. Confirmation
+         updates the existing match row or inserts a new one, so that repeating the
+         action is safe and keeps the same pickup code.
+  FR-S6  On confirmation the system shall set both reports to 'resolved', set
+         resolved_at, and assign the shared pickup code.
+  FR-S7  The system shall allow an officer to reject a suggested match. The rejection is
+         recorded as a matches row with status 'rejected', pickup_code = NULL and
+         confidence_score = 0, which permanently excludes the pair from the engine.
+  FR-S8  The system shall refuse to reject a match that is already 'pending' or
+         'verified', returning HTTP 409.
+  FR-S9  The system shall refuse to reject a pair whose two reports are not of type
+         'lost' and 'found' respectively, returning HTTP 404.
+  FR-S10 The system shall record the physical handover. Handover is executed inside a
+         single database transaction that:
+           - sets both the lost and the found report to 'resolved' and stamps resolved_at,
+           - sets the related matches to 'verified',
+           - re-queries and verifies that no report of the pair is left un-resolved,
+             and rolls the whole transaction back if any is,
+           - inserts a 'resolved' notification for each owner,
+           - writes a 'handover' activity log entry.
+         This all-or-nothing rule prevents a partial handover.
+  FR-S11 The system shall require a CSRF token and the security role for every write
+         operation on the dashboard.
+  FR-S12 The system shall allow an officer to add, edit and delete a FOUND report, with
+         the same length and status validation applied to students.
+  FR-S13 The system shall expose a count of items pending officer attention.
+  FR-S14 Every public JSON response shall be built by allowlist. No response shall contain
+         an 'internal_*' key, a debugging artefact (dump, trace, raw HTTP payload, SQL
+         text, filesystem path), or a credential (password_hash, security_code_hash,
+         security_code, session id, API key). Password-reset tokens shall be written to
+         the server log only, never to a response body. Exception detail shall be logged
+         and replaced by a generic message in the response. The invariant shall be
+         verifiable by running: php audit_api_surface.php  (exit 0 = clean, 1 = breach).
+  FR-S15 'gemini_error' in the officer-only ai_analyze_matches response is permitted
+         exception to FR-S14: it is gated by the security role and CSRF, never contains
+         the API key (which travels in a request header), and exists so the dashboard can
+         explain why AI analysis failed.
+
+5.5 MODULE: NOTIFICATIONS
+  FR-N1  The system shall create a notification for the owner of a lost report when a
+         match is found, of type 'match_found', stating the confidence and the pickup code.
+  FR-N2  The system shall create a notification for both owners on handover, of type
+         'resolved'.
+  FR-N3  The system shall create a notification when an officer confirms a match.
+  FR-N4  The system shall display the latest 10 notifications for the logged-in user and
+         the number of unread ones.
+  FR-N5  The system shall allow the user to mark all their notifications as read.
+  FR-N6  The system shall return an empty, non-error payload to a visitor who is not
+         logged in, so that the public header does not break.
+  FR-N7  The system shall display a smart-match icon in the header for notifications of
+         type 'match_found'.
+
+5.6 MODULE: AI ASSISTANCE  (config/gemini.php and the AI endpoints)
+  All AI access goes through Google Gemini over HTTPS using cURL. The API key is read
+  only from the environment (.env or the process environment) and is never stored in the
+  repository. The default model is gemini-3-flash-preview, with automatic fallback to
+  other models on HTTP 404, 429 or 503.
+
+  FR-A1  The system shall analyse a report photo and return suggested tags and a
+         structured description, in two modes:
+             mode = 'general_item'  a general lost-and-found item
+             mode = 'id_card'       a university ID or ATM card
+  FR-A2  In 'id_card' mode the system shall extract the student ID, the owner's name and
+         the college, and shall store the result in reports.ocr_data.
+  FR-A3  The system shall enhance the description of a new report using the AI provider.
+  FR-A4  The system shall provide a natural-language search that returns the IDs and
+         records of reports relevant to a free-text query, limited to 50 candidate
+         reports.
+  FR-A5  The system shall provide a conversational assistant that answers questions about
+         the user's own reports, with a per-message limit of 1000 characters.
+  FR-A6  The system shall rate-limit every endpoint per client IP. The exact limits
+         declared in the code are:
+             register         5 requests / 3600 s   api/auth.php
+             login           10 requests /  300 s   api/auth.php
+             forgot_password  5 requests /  300 s   api/auth.php
+             reset_password   5 requests /  900 s   api/auth.php
+             set_security_code 5 requests /  900 s   api/auth.php
+             ai_chat         30 requests /  300 s   api/ai_chat.php
+             ai_search       20 requests /  300 s   api/ai_search.php
+  FR-A7  IMPORTANT: every AI call shall fail gracefully. When GEMINI_API_KEY is missing
+         or the API is unreachable, the function returns null, the reason is written to
+         the error log, and the request continues without AI output. The lost-and-found
+         functionality, including matching and handover, shall remain fully operational
+         with no AI provider at all.
+
+5.7 MODULE: USER INTERFACE
+  FR-UI1 The public home page shall show headline metrics: total lost, total found,
+         total resolved, and currently active searches.
+  FR-UI2 The home page shall show a searchable, filterable grid of reports with filters
+         for category, status and type, and a reset control.
+  FR-UI3 Both matched reports of a pair shall be displayed with a consistent status.
+  FR-UI4 The profile page shall show the user's statistics and a four-step lifecycle
+         tracker per report:
+              1  submitted
+              2  smart match
+              3  ready for pickup
+              4  received
+         The tracker is driven directly by the report status.
+  FR-UI5 The profile page shall let a user close a report that is not yet resolved.
+  FR-UI6 The system shall provide a modal for reporting a lost item and a modal for
+         reporting a found item with the ID-card scanner.
+  FR-UI7 The system shall provide a FAQ section and a live activity feed.
+  FR-UI8 The system shall be designed and developed fully in Arabic (RTL). The entire
+         user interface and the whole system render right-to-left (<html lang="ar"
+         dir="rtl">) to seamlessly support the Saudi university environment.
+  FR-UI9 The profile page shall expose a security-settings card ("الإعدادات الأمنية")
+         whose edit form (current password + new security code) is hidden behind a toggle
+         button by default and only opens on explicit user click; cancelling hides and
+         resets the form without saving.
+
+
+================================================================================================
+  6. REPORT LIFECYCLE AND STATE MACHINE
+================================================================================================
+
+  reports.status transitions actually implemented:
+
+      (created) -------> active
+                          |    |
+      automatic match ----+    |   officer confirms match
+          |                       |
+          v                       v
+       matched              pending_pickup
+          |                       |
+          |                       |  officer records handover, or
+          |                       |  officer confirms the match
+          |                       |
+          +----------+------------+
+                     |
+                     v
+                 resolved            (terminal; resolved_at is stamped)
+                     ^
+                     |
+                 cancelled           (set by a manual status update)
+
+   Key points for the SRS:
+    - 'active' is the only status from which the matching engine considers a report.
+      As soon as a report leaves 'active' it is no longer offered to other reports.
+    - 'matched' and 'pending_pickup' both mean "a pair exists, handover not finished".
+      Which side gets which depends on the report type: the lost side becomes 'matched'
+      and the found side becomes 'pending_pickup'.
+    - A match is never auto-resolved. Resolution requires a human officer.
+    - matches.status is a separate, smaller state machine:
+          pending  -> suggested, awaiting officer decision
+          verified -> officer confirmed, reports closed
+          rejected -> officer refused; pair is permanently excluded
+
+   UI wording used in the code:
+     active          = "نشط"
+     matched         = "مطابق بالذكاء الاصطناعي"
+     pending_pickup  = "بانتظار الاستلام"
+     resolved        = "تم الاستلام"
+
+
+================================================================================================
+  7. NON-FUNCTIONAL REQUIREMENTS IMPLIED BY THE CODE
+================================================================================================
+
+7.1 Security
+    NFR-S1 All SQL uses PDO prepared statements. No value is concatenated into SQL.
+    NFR-S2 Every state-changing API action requires a CSRF token, verified server-side.
+    NFR-S3 All output is escaped before rendering (escapeOutput()).
+    NFR-S4 All input is sanitised on the server (sanitizeInput() / validateInput()).
+    NFR-S5 Passwords and security codes are stored only as bcrypt hashes.
+    NFR-S6 Password-reset tokens are stored only as SHA-256 hashes and are single-use.
+    NFR-S7 Image uploads are validated by inspecting the real file content, not the
+           supplied filename or MIME header; a size limit of 8 MB is applied; the
+           extension is derived from the detected format; the stored name is random.
+    NFR-S8 Image paths are normalised and restricted to an allow-list of prefixes and
+           image extensions. Remote URLs, directory traversal, non-image extensions and
+           double extensions such as 'x.php.jpg' are all rejected.
+    NFR-S9 The reset token is never written to the log unless the developer-only flag
+           LUQYA_EXPOSE_RESET_TOKEN is explicitly set to 1.
+    NFR-S10 Session identifiers are regenerated on authentication to prevent fixation.
+    NFR-S11 No AI provider key is ever committed to the source tree.
+    NFR-S12 The security dashboard re-validates the status value against the allowed
+           list on write, so an invalid status returns HTTP 400 rather than being
+           silently dropped.
+
+7.2 Performance and Availability
+    NFR-P1 Indexes exist on every column combination used for filtering in the UI
+           (user+status, status+type, pickup_code, notification feed, log date and
+           action).
+    NFR-P2 The home page and dashboards are server-rendered in a single query per
+           metric, with no N+1 access pattern in the main loops.
+    NFR-P3 The AI endpoints use a bounded timeout so a slow provider cannot block the
+           request indefinitely: 25 seconds (GEMINI_TIMEOUT) for the text endpoints in
+           config/gemini.php, and 60 seconds for image analysis in api/vision_ai.php,
+           which legitimately needs longer. Both retry down a model fallback chain.
+    NFR-P4 The matching engine queries only 'active' opposite-type reports, which bounds
+           its work as the table grows.
+    NFR-P5 AI endpoints are rate-limited per IP to protect both the provider quota and
+           the application.
+
+7.3 Maintainability and Portability
+    NFR-M1 database/schema.sql is the single authoritative definition of the schema.
+    NFR-M2 ensureSchemaUpgrades() migrates an existing database to the same structure
+           and is safe to run repeatedly, so version skew is handled automatically.
+    NFR-M3 Field length limits, status lists and enum values are declared once in
+           config/schema.php and reused by the API, rather than being repeated.
+    NFR-M4 All AI provider access is centralised in config/gemini.php, so the provider
+           can be replaced in one place.
+    NFR-M5 The application runs on shared XAMPP hosting with no build step and no
+           dependency installation.
+
+
+================================================================================================
+  8. EXTERNAL INTERFACES
+================================================================================================
+
+8.1 External system
+    - Google Gemini REST API (generativelanguage.googleapis.com), HTTPS, JSON.
+      Purpose: image analysis, ID-card OCR, description improvement, semantic search,
+                conversational assistant.
+      Authentication: API key supplied via the GEMINI_API_KEY environment variable.
+      Model: GEMINI_MODEL, defaulting to gemini-3-flash-preview. If the configured value
+             is the retired gemini-1.5-flash, it is silently replaced by the default.
+      Fallback chain, tried in order: gemini-3-flash-preview, gemini-3.6-flash,
+             gemini-flash-latest, gemini-3.5-flash, gemini-3.1-flash-lite.
+             A fallback is attempted only on HTTP 404, 429 or 503.
+      Timeouts: 25 s for text generation, 60 s for image analysis.
+      Failure: graceful degradation to "no AI output" on any failure.
+    - The application itself requires no other external service: no email server, no
+      SMS gateway, no external authentication provider. Notifications are in-app only.
+
+8.2 User interfaces
+    - Student/public: index.php, login.php, register.php, forgot_password.php,
+      profile.php
+    - Security officer: security_dashboard.php
+    - AJAX endpoints under api/, all returning JSON
+    - Administration: setup_db.php (schema creation and seeding, guarded by
+      ALLOW_DB_RESET)
+
+8.3 API action inventory (as found in the code)
+    api/auth.php          register, login, forgot_password, reset_password,
+                          set_security_code, logout
+    api/reports.php       create, close, get, my_status, statuses, potential_matches
+    api/security.php      pending_count, verify, handover, add_found, update_found,
+                          delete_found, list_pending_matches, ai_analyze_matches,
+                          confirm_match, reject_match
+    api/notifications.php (default: list + unread count), mark_read
+    api/vision_ai.php     POST, mode = general_item | id_card
+    api/ai_search.php     POST, free-text query
+    api/ai_chat.php       POST, message + history
+
+
+================================================================================================
+  9. CONFIGURATION AND ENVIRONMENT
+================================================================================================
+
+  All settings are read from a .env file; none are hard-coded in the source.
+
+  Variable                    Purpose                              Default
+  ---------------------------------------------------------------------------------------
+  DB_HOST                     database host                        localhost
+  DB_USER                     database user                        -
+  DB_PASS                     database password                    -
+  DB_NAME                     database name                        luqya_ai
+  DB_PORT                     database port                        3306
+  GEMINI_API_KEY              AI provider key                      (unset = AI disabled)
+  GEMINI_MODEL                AI model to use                      gemini-3-flash-preview
+  LUQYA_EXPOSE_RESET_TOKEN    log the raw reset token (dev only)   0
+  ALLOW_DB_RESET              permit destructive DB reset          0
+
+
+================================================================================================
+  10. NOTES FOR THE SRS WRITER — DISCREPANCIES AND GAPS
+================================================================================================
+
+  These points were found by comparing the documentation with the code. They should be
+  resolved before the SRS is finalised, because each one is either a documentation error
+  or a genuine gap between what is described and what is implemented.
+
+  D1  README.md describes the AI as "simulated". This is out of date. The code now calls
+      the real Google Gemini API from config/gemini.php, api/vision_ai.php,
+      api/ai_search.php and api/ai_chat.php.
+
+  D2  RESOLVED (2026-10-02) - README.md quoted demo credentials that did not match the
+      seed data. It listed students S000000001..S000000004, none of which exist in the
+      users table, and officers as "SEC-OFFICER-01" style display IDs. The real seeded
+      accounts are SEC-USR-1, SEC-USR-7, SEC-USR-8 and SEC-USR-9 (password security123)
+      and students S202403400, S202409876, S202401234 (password password123) plus
+      S202447940 (different password). README.md and the login.php demo panel now carry
+      the corrected, password_verify()-verified values. The SRS should quote these and
+      not the old README rows. See section 3.4.1.
+
+  D2a NEW - There is no mailer in this build, so the password-recovery requirement
+      cannot be written as "an email is sent". The flow is complete via the
+      LUQYA_EXPOSE_RESET_TOKEN=1 development path (reset link in the server error log).
+      The SRS should state the token lifetime (30 min), single use, SHA-256-at-rest and
+      the generic non-enumerating response, and must not promise email delivery. See 3.5.
+
+  D2b NEW - php.ini sets error_log to C:\xampp\php\logs\php_error_log but that directory
+      does not exist in this XAMPP install, so PHP log output (including the dev reset
+      link) lands in C:\xampp\apache\logs\error.log instead. The reviewer instruction in
+      README.md and the on-page notice in forgot_password.php both name the Apache path.
+      Fixing the php.ini path, or creating the directory, would remove the ambiguity.
+
+  D3  README.md claims the system generates 6-digit pickup codes and a "high confidence
+      score above 85%". The actual code uses the format RET-XXXXXX and an automatic
+      match threshold of 75, not 85.
+
+  D4  README.md documents a smaller file structure than the current project. It omits
+      config/schema.php, config/matching.php, config/gemini.php, api/ai_chat.php,
+      api/ai_search.php, api/vision_ai.php and views/modal_ai_chat.php.
+
+  D5  SUPERSEDED — the matching engine is now genuinely AI-powered. It is hybrid: a
+      deterministic weighted scorer (config/matching.php) always runs first, and a Gemini
+      semantic layer (geminiSemanticVerdict(), geminiSemanticScore(),
+      geminiBatchMatchAnalysis()) re-ranks the shortlist via semanticRerankCandidates().
+      The blend is local x (1 - W) + ai x W with W = MATCH_AI_BLEND_WEIGHT (0.40), and the
+      local scorer remains a hard prerequisite: the AI can veto a match or rescue an
+      under-rated pair, but cannot create one alone. The API alias runAIMatchingEngine() in
+      api/ocr_sim.php is no longer cosmetic. With no GEMINI_API_KEY, or with
+      AI_MATCHING_ENABLED=0, the engine degrades to the purely local behaviour with no
+      external call. The vision path was likewise unified: analyzeImageWithGeminiVision()
+      and api/vision_ai.php now share one transport function, callGeminiVisionAPI().
+      The AI stage has no in-repo automated regression test; it is verified manually only.
+
+  D6  reports has 17 columns in database/schema.sql, while the companion document
+      luqya_database_schema.txt lists 16 because updated_at was omitted there by
+      requirement. The SRS should document 17.
+
+  D7  The 'admin' role is declared in the users.role ENUM but no admin-specific
+      interface or API branch exists in the code. Either scope it as future work or
+      implement it.
+
+  D8  Notifications are in-app only. There is no email or SMS delivery, so the SRS
+      should not promise notification by email.
+
+  D9  The institutional email domain (uoh.edu.sa) is hard-coded in
+      generateUniversityEmail(). For a reusable SRS this should be a system parameter.
+
+  D10 The database server is not running with STRICT_TRANS_TABLES. Oversized values are
+      truncated silently by the server. Application-level validation prevents this for
+      the fields that have limits, but enabling strict mode is recommended as a second
+      layer of defence and should appear in the SRS as a deployment requirement.
+
+  D11 Match confidence is bounded only by the CHECK constraint (0..100). The code
+      clamps user-supplied confidence through normalizeConfidenceScore() before writing.
+
+  D12 users.security_code is a vestigial column. It is declared VARCHAR(20) UNIQUE but
+      the migration in config/db.php sets it to NULL for every officer and keeps the
+      login code only in security_code_hash, because an officer's code is identical to
+      their university_id (SEC-USR-<id>). The SRS should describe a single officer
+      identifier rather than two, and the unused column should be flagged for removal.
+
+  D13 The four AUTO_INCREMENT primary keys carry no explicit NOT NULL keyword in the
+      DDL even though the columns are non-nullable in practice. This document records
+      them as NOT NULL, matching server behaviour. Harmless, but worth knowing if the
+      SRS reproduces the DDL verbatim.
+
+D14 NEW - Seeded student accounts were created before the recovery security-code
+      feature, so users.security_code_hash is NULL for them and password reset works
+      with university ID + email alone. New registrations may set a code optionally,
+      and any user can add/replace one from the profile (set_security_code). The SRS
+      should state this two-tier rule rather than a universal code requirement, so it
+      matches the implementation (see 3.5).
+
+D15 NEW - README.md previously described the system as "full bilingual support (English
+      LTR & Arabic RTL)". The code is now Arabic-only: the document root is served as
+      <html lang="ar" dir="rtl">, every UI string, validation message, notification and
+      AI reply is authored in Arabic, and there is no language toggle or EN translation
+      layer. README.md has been corrected; the SRS must require fully Arabic (RTL)
+      presentation with no English fallback.
+
+================================================================================================
+  END OF REFERENCE
+================================================================================================

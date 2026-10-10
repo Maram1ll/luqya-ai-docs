@@ -1,0 +1,262 @@
+Luqya AI platform user interface and the entire system are fully designed and developed in Arabic (RTL).
+============================================================================================
+  لُقيا AI  |  LUQYA AI  -  مخطط قاعدة البيانات  |  DATABASE SCHEMA REFERENCE
+============================================================================================
+
+  لغة المنصة : واجهة لُقيا AI والنظام بأكمله مصمَّمان ومطوَّران بالكامل باللغة العربية
+               وبالاتجاه من اليمين إلى اليسار (RTL) لدعم بيئة الجامعات السعودية بسلاسة،
+               بحيث تُقدَّم الصفحات دائماً بصيغة <html lang="ar" dir="rtl">.
+
+  قاعدة البيانات   : luqya_ai
+  المحرك           : InnoDB
+  ترميز المحارف    : utf8mb4 / utf8mb4_unicode_ci
+  الخادم           : MariaDB 10.4.32
+  sql_mode         : NO_ZERO_IN_DATE, NO_ZERO_DATE, NO_ENGINE_SUBSTITUTION
+  الوضع الصارم     : غير مفعّل - القيم الزائدة تُقتطع بصمت بدل رفضها
+
+  مصادر هذا الملف (الأولوية بالترتيب):
+    1. database/schema.sql        التعريف الرسمي للمخطط والبيانات التجريبية
+    2. config/schema.php         ثوابت الأطوال وقوائم القيم المسموح بها في PHP
+    3. config/db.php             دوال الترحيل التلقائي وسجل التدقيق
+
+  الأنواع في هذا الملف منقولة حرفياً من تعريف الأعمدة في database/schema.sql.
+  لا تظهر بها عروض العرض التي تضيفها MariaDB تلقائياً (مثل int(11)).
+
+  عدد الحقول: users 13 | reports 17 | matches 10 | notifications 7
+              activity_logs 6 | password_resets 6          (الإجمالي 59)
+
+============================================================================================
+  1) ملخص الجداول
+============================================================================================
+
+  الجدول             الحقول  المحرك   الوصف
+  ----------------------------------------------------------------------------------
+  users                  13  InnoDB  الحسابات وكلمات المرور مُخزَّنة كـ bcrypt hash
+  reports                17  InnoDB  بلاغات المفقودات والمعثورات - قلب النظام
+  matches                10  InnoDB  المطابقات بين بلاغ مفقود وآخر معثور
+  notifications           7  InnoDB  إشعارات المستخدمين
+  activity_logs          6  InnoDB  سجل تدقيق للعمليات الحساسة
+  password_resets        6  InnoDB  رموز استعادة كلمة المرور (hash فقط)
+
+============================================================================================
+  2) جدول users  (13 حقلاً)
+============================================================================================
+
+  #   العمود                النوع          NULL    المفتاح   الافتراضي
+  ----------------------------------------------------------------------------------
+  1   id                    INT            NO      PRI       AUTO_INCREMENT
+  2   university_id         VARCHAR(20)    NO      UNI       -
+  3   full_name             VARCHAR(100)   NO               -
+  4   email                 VARCHAR(100)   NO      UNI       -
+  5   phone                 VARCHAR(20)    YES              NULL
+  6   college               VARCHAR(100)   YES              NULL
+  7   major                 VARCHAR(100)   YES              NULL
+  8   password_hash         VARCHAR(255)   NO               -
+  9   role                  ENUM('student', 'security', 'admin')   YES     'student'
+  10  security_code         VARCHAR(20)    YES      UNI       NULL
+  11  security_code_hash    VARCHAR(255)   YES              NULL
+  12  created_at            DATETIME       NO               CURRENT_TIMESTAMP
+  13  updated_at            DATETIME       YES              CURRENT_TIMESTAMP + ON UPDATE
+
+  role ENUM('student', 'security', 'admin')
+
+  security_code_hash: بصمة bcrypt (60 حرفاً) تدير مفتاحين للاسترجاع:
+   - كود ضابط الأمن (SEC-USR-<id>) — يطابق university_id ويُخزَّن كبصمة فقط عبر ترقية
+     autofillOfficerLoginCodes().
+   - رمز أمني اختياري للطالب — يُنشأ عند التسجيل (حقل optional) أو لاحقاً عبر
+     action='set_security_code' من صفحة الملف الشخصي.
+   عند إعادة تعيين كلمة المرور يُشترط الرمز للحسابات التي لديها بصمة (security_code_hash
+   غير فارغ)، بينما الحسابات القديمة التي أُنشئت قبل تفعيل الرمز تُستعاد بالرقم الجامعي
+   والبريد فقط.
+  security_code: عمود تراثي يحتفظ دائماً بـ NULL؛ الكود الحقيقي يعيش في security_code_hash.
+
+============================================================================================
+  3) جدول reports  (17 حقلاً)
+============================================================================================
+
+  #   العمود                 النوع          NULL    المفتاح   الافتراضي
+  ----------------------------------------------------------------------------------
+  1   id                     INT            NO      PRI       AUTO_INCREMENT
+  2   user_id                INT            NO      FK        -  -> users(id)
+  3   type                   ENUM('lost', 'found')   NO          -
+  4   title                  VARCHAR(200)   NO               -
+  5   category               VARCHAR(50)    NO               -
+  6   description            TEXT           NO               -
+  7   location               VARCHAR(250)   NO               -
+  8   date_event             DATE           NO               -
+  9   image_url              VARCHAR(255)   YES              NULL
+  10  ai_tags                VARCHAR(500)   YES              NULL
+  11  ocr_data               TEXT           YES              NULL
+  12  distinctive_features   TEXT           YES              NULL
+  13  status                 ENUM('active', 'matched', 'pending_pickup', 'resolved', 'cancelled')  YES  'active'
+  14  pickup_code            VARCHAR(20)    YES              NULL
+  15  resolved_at            DATETIME       YES              NULL
+  16  created_at             DATETIME       NO               CURRENT_TIMESTAMP
+  17  updated_at             DATETIME       YES              CURRENT_TIMESTAMP + ON UPDATE
+
+  type   ENUM('lost', 'found')
+  status ENUM('active', 'matched', 'pending_pickup', 'resolved', 'cancelled')
+
+============================================================================================
+  4) جدول matches  (10 حقول)
+============================================================================================
+
+  #   العمود             النوع       NULL    المفتاح   الافتراضي
+  ----------------------------------------------------------------------------------
+  1   id                 INT         NO      PRI       AUTO_INCREMENT
+  2   lost_report_id     INT         NO      FK        -  -> reports(id)
+  3   found_report_id    INT         NO      FK        -  -> reports(id)
+  4   confidence_score   INT         NO               85
+  5   pickup_code        VARCHAR(20) YES      UNI       NULL
+  6   status             ENUM('pending', 'verified', 'rejected')   YES      'pending'
+  7   matched_at         DATETIME    YES              CURRENT_TIMESTAMP
+  8   resolved_at        DATETIME    YES              NULL
+  9   created_at         DATETIME    NO               CURRENT_TIMESTAMP
+  10  updated_at         DATETIME    YES              CURRENT_TIMESTAMP + ON UPDATE
+
+  status ENUM('pending', 'verified', 'rejected')
+  قيد  : chk_matches_confidence CHECK (confidence_score BETWEEN 0 AND 100)
+
+============================================================================================
+  5) جدول notifications  (7 حقول)
+============================================================================================
+
+  #   العمود      النوع         NULL    المفتاح   الافتراضي
+  ----------------------------------------------------------------------------------
+  1   id          INT           NO      PRI       AUTO_INCREMENT
+  2   user_id     INT           NO      FK        -  -> users(id)
+  3   title       VARCHAR(150)  NO               -
+  4   message     TEXT          NO               -
+  5   type        VARCHAR(50)   YES              'info'
+  6   is_read     TINYINT(1)    YES              0
+  7   created_at  DATETIME      NO               CURRENT_TIMESTAMP
+
+  type ليس ENUM عمداً لمرونة الإشعارات. القيم المستخدمة في التطبيق:
+  'info' | 'match_found' | 'resolved'
+
+============================================================================================
+  6) جدول activity_logs  (6 حقول)
+============================================================================================
+
+  #   العمود        النوع         NULL    المفتاح   الافتراضي
+  ----------------------------------------------------------------------------------
+  1   id            INT           NO      PRI       AUTO_INCREMENT
+  2   action_type   VARCHAR(50)   NO               -
+  3   item_title    VARCHAR(200)  NO               -
+  4   details       TEXT          NO               -
+  5   user_name     VARCHAR(100)  NO               -
+  6   created_at    DATETIME      NO               CURRENT_TIMESTAMP
+
+  لا يوجد مفتاح أجنبي بالتصميم: السجل يجب أن يبقى بعد حذف المستخدم.
+
+============================================================================================
+  7) جدول password_resets  (6 حقول)
+============================================================================================
+
+  #   العمود        النوع       NULL    المفتاح   الافتراضي
+  ----------------------------------------------------------------------------------
+  1   id            INT         NO      PRI       AUTO_INCREMENT
+  2   user_id       INT         NO      FK        -  -> users(id)
+  3   token_hash    CHAR(64)    NO      UNI       -
+  4   expires_at    DATETIME    NO               -
+  5   used_at       DATETIME    YES              NULL
+  6   created_at    DATETIME    NO               CURRENT_TIMESTAMP
+
+  يُخزَّن SHA-256 للرمز فقط. لا تُحفظ الرموز الخام إطلاقاً.
+  عملية إصدار الرمز (forgot_password) تشترط الرقم الجامعي + البريد المسجل بالضبط،
+  والرمز الأمني إن كان مطلوباً للحساب، قبل إنشاء سطر في هذا الجدول.
+
+============================================================================================
+  8) الفهارس (Indexes)
+============================================================================================
+
+  users
+    PRIMARY            UNIQUE  (id)
+    university_id      UNIQUE  (university_id)
+    email              UNIQUE  (email)
+    security_code      UNIQUE  (security_code)
+    idx_users_role     INDEX   (role)
+
+  reports
+    PRIMARY                  UNIQUE  (id)
+    idx_reports_user_status  INDEX   (user_id, status)
+    idx_reports_status_type  INDEX   (status, type)
+    idx_reports_pickup       INDEX   (pickup_code)
+
+  matches
+    PRIMARY            UNIQUE  (id)
+    uk_matches_pair    UNIQUE  (lost_report_id, found_report_id)
+    uk_matches_pickup  UNIQUE  (pickup_code)
+    found_report_id    INDEX   (found_report_id)
+
+  notifications
+    PRIMARY                  UNIQUE  (id)
+    idx_notifications_feed   INDEX   (user_id, is_read, created_at)
+
+  activity_logs
+    PRIMARY                     UNIQUE  (id)
+    idx_activity_logs_created   INDEX   (created_at)
+    idx_activity_logs_action    INDEX   (action_type)
+
+  password_resets
+    PRIMARY              UNIQUE  (id)
+    token_hash           UNIQUE  (token_hash)
+    idx_resets_user      INDEX   (user_id)
+    idx_resets_expiry    INDEX   (expires_at)
+
+============================================================================================
+  9) المفاتيح الأجنبية (Foreign Keys)
+============================================================================================
+
+  كل المفاتيح الأجنبية تستخدم ON DELETE CASCADE.
+
+  reports.user_id              ->  users.id
+  matches.lost_report_id      ->  reports.id
+  matches.found_report_id     ->  reports.id
+  notifications.user_id        ->  users.id
+  password_resets.user_id      ->  users.id
+
+============================================================================================
+  10) قيود CHECK
+============================================================================================
+
+  matches.chk_matches_confidence    CHECK (confidence_score BETWEEN 0 AND 100)
+
+============================================================================================
+  11) حدود الأطوال في PHP  (config/schema.php)
+============================================================================================
+
+  يجب ألا تتجاوز هذه الحدود عرض الأعمدة أعلاه. قاعدة البيانات ليست في الوضع
+  الصارم، فأي قيمة أطول من العمود تُقتطع بصمت بلا خطأ.
+
+  REPORT_TITLE_MAX            200     reports.title
+  REPORT_CATEGORY_MAX          50     reports.category
+  REPORT_DESCRIPTION_MAX      4000    reports.description
+  REPORT_LOCATION_MAX         250     reports.location
+  REPORT_AI_TAGS_MAX          500     reports.ai_tags
+  REPORT_FEATURES_MAX         2000    reports.distinctive_features
+  REPORT_IMAGE_URL_MAX        255     reports.image_url
+  NOTIFICATION_TITLE_MAX      150     notifications.title
+  NOTIFICATION_TYPE_MAX        50     notifications.type
+  ACTIVITY_ITEM_TITLE_MAX     200     activity_logs.item_title
+  ACTIVITY_DETAILS_MAX        2000    activity_logs.details
+  USER_FULL_NAME_MAX          100     users.full_name
+
+  لا يوجد حد في PHP لـ users.password_hash ولا security_code_hash:
+  عموداهما VARCHAR(255) ويخزّنان ناتج bcrypt (60 محرفاً).
+
+============================================================================================
+  12) ملاحظات تشغيلية
+============================================================================================
+
+  - ترقية قاعدة بيانات قائمة: استدعِ ensureSchemaUpgrades($pdo) مرة واحدة في
+    config/db.php. الدالة آمنة عند التكرار ولا تُسقط أي بيانات.
+  - تهيئة جديدة: افتح setup_db.php (يحترم ALLOW_DB_RESET في .env).
+  - ينصح بتفعيل STRICT_TRANS_TABLES في إعداد الخادم ليكون خط دفاع ثانٍ
+    إلى جانب التحقق الموجود في التطبيق.
+  - password_reset_token لا يُطبع كاملاً إلا عند LUQYA_EXPOSE_RESET_TOKEN=1،
+    وتبقى القيمة الافتراضية 0.
+
+============================================================================================
+  نهاية الملف
+============================================================================================
